@@ -1,0 +1,41 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // PUBLIC ACCESS FOR PROTOTYPE (Auth disabled in console)
+    // Note: In a production environment, you MUST enable an Auth provider 
+    // and restrict this to only authenticated users (request.auth != null).
+
+    match /agents/{id} {
+      allow read, write: if true;
+    }
+
+    match /leads/{id} {
+      allow read, write: if true;
+    }
+
+    match /otps/{id} {
+      allow read, write: if true;
+    }
+
+    match /logs/{id} {
+      allow read, write: if true;
+    }
+
+    match /customers/{id} {
+      allow read, write: if true;
+    }
+
+    match /app_settings/{id} {
+      allow read, write: if true;
+    }
+
+    match /_heartbeat_/{id} {
+      allow read, write: if true;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
