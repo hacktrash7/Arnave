@@ -1,0 +1,103 @@
+{
+  "entities": {
+    "Agent": {
+      "title": "Agent",
+      "description": "System agent or admin details",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "contactNumber": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "agent"] },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "email", "role", "active"]
+    },
+    "Lead": {
+      "title": "Lead",
+      "description": "Potential customer lead",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string" },
+        "status": { "type": "string" },
+        "assignedTo": { "type": "string" },
+        "isHot": { "type": "boolean" },
+        "followUpDate": { "type": "string", "format": "date-time" },
+        "lastDisposition": { "type": "string" },
+        "remarks": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "phone", "status", "createdAt"]
+    },
+    "OTP": {
+      "title": "OTP",
+      "description": "One-time password for login",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "otp": { "type": "string" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "agentName": { "type": "string" },
+        "contactNumber": { "type": "string" }
+      },
+      "required": ["email", "otp", "expiresAt", "createdAt"]
+    },
+    "Log": {
+      "title": "Log",
+      "description": "System activity log",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "action": { "type": "string" },
+        "details": { "type": "string" },
+        "leadId": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "action", "timestamp"]
+    },
+    "Heartbeat": {
+      "title": "Heartbeat",
+      "description": "Connection pulse to prevent idle timeout",
+      "type": "object",
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "firestore": {
+    "agents": {
+      "schema": "Agent",
+      "description": "Collection of all authorized agents and admins"
+    },
+    "leads": {
+      "schema": "Lead",
+      "description": "Collection of all leads in the CRM"
+    },
+    "otps": {
+      "schema": "OTP",
+      "description": "Collection of active and expired OTPs for control panel visibility"
+    },
+    "logs": {
+      "schema": "Log",
+      "description": "System activity logs"
+    },
+    "customers": {
+      "schema": { "type": "object", "properties": {} },
+      "description": "Customer profiles linked to leads"
+    },
+    "app_settings": {
+      "schema": { "type": "object", "properties": { "autoAssignEnabled": { "type": "boolean" } } },
+      "description": "Global application configuration"
+    },
+    "_heartbeat_": {
+      "schema": "Heartbeat",
+      "description": "Technical collection for connection pulsing"
+    }
+  }
+}

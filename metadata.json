@@ -1,0 +1,6 @@
+{
+  "name": "TheFrugalAdvisorCo",
+  "description": "Internal CRM for TheFrugalAdvisorCo featuring agent login, lead management, and customer tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
