@@ -3,7 +3,7 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import { initializeApp } from "firebase/app";
-import { initializeFirestore, collection, addDoc, getDocs, query, where, doc, deleteDoc, updateDoc, writeBatch, orderBy, limit } from "firebase/firestore";
+import { initializeFirestore, collection, addDoc, getDoc, getDocs, query, where, doc, deleteDoc, updateDoc, writeBatch, orderBy, limit } from "firebase/firestore";
 import dotenv from "dotenv";
 import fs from "fs";
 import nodemailer from "nodemailer";
@@ -247,37 +247,68 @@ async function startServer() {
     if (!agentId) return res.status(400).json({ error: "Agent ID required" });
 
     try {
+      // Fetch the agent by direct doc reference. The previous implementation
+      // used `where("__name__", "==", agentId)` which silently returned an
+      // empty snapshot in the Firestore Web SDK (the special __name__ field
+      // is a DocumentReference, not a string), so the entire unassign step
+      // was being skipped and only the agent doc was deleted.
       const agentRef = doc(db, "agents", agentId);
-      const agentSnap = await getDocs(
-        query(collection(db, "agents"), where("__name__", "==", agentId))
-      );
+      const agentDoc = await getDoc(agentRef);
 
-      if (agentSnap.empty) {
+      if (!agentDoc.exists()) {
         return res.status(404).json({ error: "Agent not found" });
       }
 
-      const agentData = agentSnap.docs[0].data() as any;
-      const agentEmail = agentData.email;
-      const agentName = agentData.name || agentEmail || agentId;
+      const agentData = agentDoc.data() as any;
+      const agentEmail: string | undefined = agentData.email;
+      const agentName: string =
+        agentData.name || agentEmail || agentId;
 
+      // Leads can be linked to an agent by email (current convention) or, in
+      // legacy / inconsistent data, by the agent's doc id. Gather both so the
+      // unassign / cascade-delete is exhaustive.
       const leadsRef = collection(db, "leads");
-      const q = query(leadsRef, where("assignedTo", "==", agentEmail));
-      const leadSnap = await getDocs(q);
+      const lookupKeys = Array.from(
+        new Set(
+          [agentEmail, agentId].filter(
+            (v): v is string => typeof v === "string" && v.length > 0
+          )
+        )
+      );
+
+      const seen = new Set<string>();
+      const matchedLeads: Array<{ id: string; ref: any }> = [];
+
+      for (const key of lookupKeys) {
+        const snap = await getDocs(
+          query(leadsRef, where("assignedTo", "==", key))
+        );
+        snap.docs.forEach(d => {
+          if (!seen.has(d.id)) {
+            seen.add(d.id);
+            matchedLeads.push({ id: d.id, ref: d.ref });
+          }
+        });
+      }
+
+      console.log(
+        `[agent-delete] agentId=${agentId} email=${agentEmail} permanent=${permanent} matchedLeads=${matchedLeads.length}`
+      );
 
       let affectedLeads = 0;
 
-      if (!leadSnap.empty) {
+      if (matchedLeads.length > 0) {
         if (permanent) {
-          const ops = leadSnap.docs.map(d => ({
+          const ops = matchedLeads.map(l => ({
             type: "delete" as const,
-            ref: d.ref,
+            ref: l.ref,
           }));
           await commitInChunks(ops);
           affectedLeads = ops.length;
         } else {
-          const ops = leadSnap.docs.map(d => ({
+          const ops = matchedLeads.map(l => ({
             type: "update" as const,
-            ref: d.ref,
+            ref: l.ref,
             data: {
               assignedTo: null,
               assignedToName: null,
