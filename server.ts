@@ -181,41 +181,133 @@ async function startServer() {
     }
   });
 
+  // Helper: write an audit log entry. Failures are swallowed so they never
+  // block the primary destructive action that the operator just confirmed.
+  const writeAuditLog = async (entry: {
+    action: string;
+    details: string;
+    userId?: string;
+    userName?: string;
+    leadId?: string;
+  }) => {
+    try {
+      await addDoc(collection(db, "logs"), {
+        userId: entry.userId || "system",
+        userName: entry.userName || "System",
+        action: entry.action,
+        details: entry.details,
+        leadId: entry.leadId || "",
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error("Failed to write audit log:", err);
+    }
+  };
+
+  // Commit a batch in chunks. Firestore caps each batch at 500 writes.
+  const commitInChunks = async (
+    refs: Array<{ type: "delete" | "update"; ref: any; data?: any }>
+  ) => {
+    const CHUNK = 450;
+    for (let i = 0; i < refs.length; i += CHUNK) {
+      const slice = refs.slice(i, i + CHUNK);
+      const batch = writeBatch(db);
+      slice.forEach(op => {
+        if (op.type === "delete") batch.delete(op.ref);
+        else batch.update(op.ref, op.data);
+      });
+      await batch.commit();
+    }
+  };
+
   // API Route for Agent Deletion
+  //
+  // Default behaviour: delete the agent document and unassign their leads
+  // (leads are preserved so they can be reassigned).
+  //
+  // ?permanent=true : delete the agent document AND every lead assigned to
+  // them. This is a destructive, non-reversible "hard delete" intended for
+  // admin clean-up of test data or off-boarded agents whose pipeline should
+  // also be purged. The caller may pass `actorId` / `actorName` in the body
+  // (or `x-actor-*` headers) so the audit log records who performed the
+  // action.
   server.delete("/api/agents/:agentId", async (req, res) => {
     const { agentId } = req.params;
+    const permanent =
+      req.query.permanent === "true" || req.query.permanent === "1";
+    const actorId =
+      (req.body && req.body.actorId) ||
+      (req.headers["x-actor-id"] as string) ||
+      "system";
+    const actorName =
+      (req.body && req.body.actorName) ||
+      (req.headers["x-actor-name"] as string) ||
+      "System";
+
     if (!agentId) return res.status(400).json({ error: "Agent ID required" });
 
     try {
-      // 1. Get Agent email to find assigned leads
       const agentRef = doc(db, "agents", agentId);
-      const agentSnap = await getDocs(query(collection(db, "agents"), where("__name__", "==", agentId)));
-      
-      if (!agentSnap.empty) {
-        const agentData = agentSnap.docs[0].data();
-        const agentEmail = agentData.email;
+      const agentSnap = await getDocs(
+        query(collection(db, "agents"), where("__name__", "==", agentId))
+      );
 
-        // 2. Find all leads assigned to this agent
-        const leadsRef = collection(db, "leads");
-        const q = query(leadsRef, where("assignedTo", "==", agentEmail));
-        const leadSnap = await getDocs(q);
+      if (agentSnap.empty) {
+        return res.status(404).json({ error: "Agent not found" });
+      }
 
-        // 3. Unassign leads in batch
-        if (!leadSnap.empty) {
-          const batch = writeBatch(db);
-          leadSnap.docs.forEach(leadDoc => {
-            batch.update(leadDoc.ref, {
+      const agentData = agentSnap.docs[0].data() as any;
+      const agentEmail = agentData.email;
+      const agentName = agentData.name || agentEmail || agentId;
+
+      const leadsRef = collection(db, "leads");
+      const q = query(leadsRef, where("assignedTo", "==", agentEmail));
+      const leadSnap = await getDocs(q);
+
+      let affectedLeads = 0;
+
+      if (!leadSnap.empty) {
+        if (permanent) {
+          const ops = leadSnap.docs.map(d => ({
+            type: "delete" as const,
+            ref: d.ref,
+          }));
+          await commitInChunks(ops);
+          affectedLeads = ops.length;
+        } else {
+          const ops = leadSnap.docs.map(d => ({
+            type: "update" as const,
+            ref: d.ref,
+            data: {
               assignedTo: null,
               assignedToName: null,
-              updatedAt: new Date().toISOString()
-            });
-          });
-          await batch.commit();
+              updatedAt: new Date().toISOString(),
+            },
+          }));
+          await commitInChunks(ops);
+          affectedLeads = ops.length;
         }
       }
 
       await deleteDoc(agentRef);
-      res.status(200).json({ message: "Agent deleted and leads unassigned" });
+
+      await writeAuditLog({
+        action: permanent ? "AGENT_PERMANENT_DELETE" : "AGENT_DELETE",
+        details: permanent
+          ? `Permanently removed agent ${agentName} (${agentEmail}) and ${affectedLeads} associated lead(s).`
+          : `Removed agent ${agentName} (${agentEmail}); ${affectedLeads} lead(s) unassigned.`,
+        userId: actorId,
+        userName: actorName,
+      });
+
+      res.status(200).json({
+        message: permanent
+          ? "Agent and all associated leads permanently deleted"
+          : "Agent deleted and leads unassigned",
+        permanent,
+        deletedAgentId: agentId,
+        leadsAffected: affectedLeads,
+      });
     } catch (error) {
       console.error("Error deleting agent:", error);
       res.status(500).json({ error: "Failed to delete agent" });
@@ -373,6 +465,100 @@ async function startServer() {
     } catch (error) {
       console.error("Error fetching customer profile:", error);
       res.status(500).json({ error: "Failed to fetch customer profile" });
+    }
+  });
+
+  // API Route for Customer Deletion
+  //
+  // Customers in this CRM are mostly virtual: they are identified by the
+  // `customerId` field stamped onto each lead at intake. A customer doc may
+  // also exist in the `customers` collection.
+  //
+  // ?permanent=true : hard-delete every lead with this customerId AND the
+  // customer document (if present). Without `permanent=true` the endpoint
+  // refuses to act, because there is no meaningful "soft delete" for a
+  // customer that is purely derived from their leads — the caller must
+  // explicitly opt in to the destructive operation.
+  server.delete("/api/customers/:customerId", async (req, res) => {
+    const { customerId } = req.params;
+    const permanent =
+      req.query.permanent === "true" || req.query.permanent === "1";
+    const actorId =
+      (req.body && req.body.actorId) ||
+      (req.headers["x-actor-id"] as string) ||
+      "system";
+    const actorName =
+      (req.body && req.body.actorName) ||
+      (req.headers["x-actor-name"] as string) ||
+      "System";
+
+    if (!customerId) {
+      return res.status(400).json({ error: "Customer ID required" });
+    }
+
+    if (!permanent) {
+      return res.status(400).json({
+        error:
+          "Customer deletion is destructive. Pass ?permanent=true to confirm.",
+      });
+    }
+
+    try {
+      const leadsRef = collection(db, "leads");
+      const q = query(leadsRef, where("customerId", "==", customerId));
+      const leadSnap = await getDocs(q);
+
+      let customerLabel = customerId;
+      let deletedLeads = 0;
+
+      if (!leadSnap.empty) {
+        const first = leadSnap.docs[0].data() as any;
+        customerLabel = first.name
+          ? `${first.name} (${customerId})`
+          : customerId;
+
+        const ops = leadSnap.docs.map(d => ({
+          type: "delete" as const,
+          ref: d.ref,
+        }));
+        await commitInChunks(ops);
+        deletedLeads = ops.length;
+      }
+
+      // Also remove the customer doc itself if one exists. Wrapped so a
+      // missing customers/{id} document doesn't fail the whole request.
+      let customerDocDeleted = false;
+      try {
+        await deleteDoc(doc(db, "customers", customerId));
+        customerDocDeleted = true;
+      } catch (err) {
+        console.warn(
+          `No standalone customer doc to delete for ${customerId} (this is fine):`,
+          err
+        );
+      }
+
+      if (deletedLeads === 0 && !customerDocDeleted) {
+        return res.status(404).json({ error: "Customer not found" });
+      }
+
+      await writeAuditLog({
+        action: "CUSTOMER_PERMANENT_DELETE",
+        details: `Permanently removed customer ${customerLabel} and ${deletedLeads} associated lead(s).`,
+        userId: actorId,
+        userName: actorName,
+      });
+
+      res.status(200).json({
+        message: "Customer and all associated leads permanently deleted",
+        permanent: true,
+        deletedCustomerId: customerId,
+        leadsDeleted: deletedLeads,
+        customerDocDeleted,
+      });
+    } catch (error) {
+      console.error("Error deleting customer:", error);
+      res.status(500).json({ error: "Failed to delete customer" });
     }
   });
 
